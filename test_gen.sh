@@ -33,5 +33,5 @@ done
 
 wait
 python ./generation/merge_data.py --base_path ${output_dir} \
-                                  --output_dir ./Outputs-Online-RLHF/iterative-prompt-v1-iter1-20K/gen_data.json \
+                                  --output_dir ../Outputs-Online-RLHF/iterative-prompt-v1-iter1-20K/gen_data.json \
                                   --num_datasets ${my_world_size}
