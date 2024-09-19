@@ -16,7 +16,7 @@ else
     echo "Directory $output_folder already exists."
 fi
 
-# Array of GPU IDs to be used
+# Array of GPU IDs to be used......
 declare -a gpus=(0 1 2 3 4 5 6 7)
 
 # conda activate vllm
