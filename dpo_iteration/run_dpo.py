@@ -12,7 +12,8 @@ from transformers import (
     HfArgumentParser,
     TrainingArguments,
 )
-
+import torch.distributed as dist
+from accelerate import Accelerator
 
 @dataclass
 class ScriptArguments:
@@ -40,7 +41,10 @@ class ScriptArguments:
         default="/export/home/hanze/project/vllm-gen/uf_split0_offline_reward.json",  # "/export/home/data/gemma_it_2b_3w_k8_with_pairrm_rewards.json",
         metadata={"help": "the location of the evalset name or path"},
     )
-    learning_rate: Optional[float] = field(default=5e-7, metadata={"help": "optimizer learning rate"})
+    learning_rate: Optional[float] = field(default=5e-7, 
+        metadata={"help": "optimizer learning rate"})
+    # RZ: Here we use defaulted values as in the RLHFlow paper.
+
     lr_scheduler_type: Optional[str] = field(
         default="constant_with_warmup", metadata={"help": "the lr scheduler type"}
     )
@@ -53,6 +57,7 @@ class ScriptArguments:
     gradient_accumulation_steps: Optional[int] = field(
         default=16, metadata={"help": "the number of gradient accumulation steps"}
     )
+    # RZ: Here we should change a number
     gradient_checkpointing: Optional[bool] = field(
         default=True, metadata={"help": "whether to use gradient checkpointing"}
     )
@@ -106,16 +111,17 @@ class ScriptArguments:
 
 
 def prepare_data(
-    data_dir: str = "/home/xiongwei/data/helpful/rm/rm1003.json",
+    data_dir: str = "/home/xiongwei/data/helpful/rm/rm1003.json", # RZ: A json file.
     sanity_check: bool = False,
     cache_dir: str = None,
     num_proc=24,
-    margin_scale=1,
-    choose_type="random",
-    eot_token="",
+    margin_scale=1, # RZ: By default this is 1.0
+    choose_type="random", # RZ: By default this is max_random, but we use max_min in the code.
+    eot_token="", # RZ: the end-of-text token
     length_penalty=0,
 ) -> Dataset:
-    """Prepare the dataset for DPO training by rejection sampling.
+    """
+    Prepare the dataset for DPO training by rejection sampling.
     We implement different strategies to select pairs, including
     max_min: best v.s. worst
     max_random: best v.s. random from the remaining;
@@ -123,14 +129,18 @@ def prepare_data(
     max_min_p: best v.s. worst but we additionally add a length penalty in the reward value
     """
     ds = load_dataset("json", data_files=data_dir, split="train", field="instances")
-    print(ds)
+    # RZ: ds is an instance of datasets.arrow_dataset.Dataset
+    # RZ: ds[0] is a dictionary with keys = dict_keys(['rewards', 'prompt', 'responses']).
+    # local_rank = Accelerator().local_process_index
+    # if local_rank == 0:
+    #     embed()
 
     pos = []
     neg = []
     prompts = []
 
     margin = []
-    for sample in ds:
+    for index, sample in enumerate(ds):
         if choose_type == "random":
             idx0 = 0
             idx1 = 1
@@ -140,6 +150,8 @@ def prepare_data(
                 idx1 = 1
             else:
                 idx1 = 0
+
+        # RZ: we use this.
         elif choose_type == "max_min":
             idx0 = np.argmax(sample["rewards"])
             idx1 = np.argmin(sample["rewards"])
@@ -166,6 +178,7 @@ def prepare_data(
                 margin.append((sample["rewards"][idx0[i]] - sample["rewards"][idx1[i]]) * margin_scale)
         else:
             if sample["rewards"][idx0] > sample["rewards"][idx1]:
+                # RZ: we enter this branch.
                 prompts.append(sample["prompt"])
                 pos.append(sample["responses"][idx0] + eot_token)
                 neg.append(sample["responses"][idx1] + eot_token)
@@ -176,6 +189,11 @@ def prepare_data(
                 neg.append(sample["responses"][idx0] + eot_token)
                 margin.append((-sample["rewards"][idx0] + sample["rewards"][idx1]) * margin_scale)
     dataset = Dataset.from_dict({"prompt": prompts, "chosen": pos, "rejected": neg, "margin": margin})
+    
+    print(f'prompt: {prompts[0]}')
+    print(f'chosen: {pos[0]}')
+    print(f'rejected: {neg[0]}')
+    print(f'margin: {margin[0]}')
 
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 100)))
@@ -184,23 +202,29 @@ def prepare_data(
 
 
 if __name__ == "__main__":
+    print('Training DPO..............')
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
     # 1. load a pretrained model
+    print(f'Loading a pretrained model.......{script_args.model_name_or_path}')
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name_or_path,
-        use_flash_attention_2=True,
+        attn_implementation="flash_attention_2", # RZ: The model was loaded with use_flash_attention_2=True, which is deprecated and may be removed in a future release. Please use `attn_implementation="flash_attention_2"` instead.
         torch_dtype=torch.float16,
     )
     model.config.use_cache = False
+    # RZ: The model will not cache the hidden states, meaning that during generation, the model will recompute the hidden states for the entire sequence at each step. This can slow down the process, but it might be necessary for specific use cases.
+    # RZ: If you are training a model, especially with techniques like gradient checkpointing, caching can lead to excessive memory usage or interfere with backpropagation. In such cases, disabling the cache is essential.
+    # RZ: Disabling the cache reduces memory usage since the model doesn't store intermediate states. This might be necessary if you're running into memory issues, especially when fine-tuning large models.
 
-    if script_args.ignore_bias_buffers:
+    if script_args.ignore_bias_buffers: # RZ: By default this is False.
         # torch distributed hack
         model._ddp_params_and_buffers_to_ignore = [
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
+    # RZ: read the reference model.
     if script_args.ref_model:
         ref_name = script_args.ref_model
     else:
@@ -209,12 +233,15 @@ if __name__ == "__main__":
     model_ref = AutoModelForCausalLM.from_pretrained(
         ref_name,
         torch_dtype=torch.bfloat16,
-        use_flash_attention_2=True,
+        attn_implementation="flash_attention_2"
     )
+
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-    if script_args.eos_padding:
+
+    if script_args.eos_padding: # RZ: by default this is True
         tokenizer.pad_token = tokenizer.eos_token
     else:
+        print('We do not use eos padding........')
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         model.config.vocab_size += 1
         model_ref.config.vocab_size += 1
@@ -223,26 +250,17 @@ if __name__ == "__main__":
         model.resize_token_embeddings(len(tokenizer))
         model_ref.resize_token_embeddings(len(tokenizer))
 
-    def tokenize(sample):
-        tokenized_pos = tokenizer(sample["prompt"].replace("<bos>", "") + "\n" + sample["chosen"])
-        tokenized_neg = tokenizer(sample["prompt"].replace("<bos>", "") + "\n" + sample["rejected"])
-        prompt_id = tokenizer(sample["prompt"])
-        sample["tprompdt_ids"] = prompt_id["input_ids"]
-        sample["tchosen_input_ids"] = tokenized_pos["input_ids"]
-        sample["trejected_input_ids"] = tokenized_neg["input_ids"]
-        return sample
-
     # 2. Load the Stack-exchange paired dataset
+    print('Loading the pretraining and evaluation dataset')
     train_dataset = prepare_data(
         data_dir=script_args.train_dir,
-        margin_scale=script_args.margin_scale,
-        sanity_check=script_args.sanity_check,
-        choose_type=script_args.choose_type,
-        eot_token=script_args.eot_token,
-        length_penalty=script_args.len_penalty,
+        margin_scale=script_args.margin_scale, # RZ: By default this is 1.0.
+        sanity_check=script_args.sanity_check, # RZ: By default this is False.
+        choose_type=script_args.choose_type, # RZ: By default this is max_random.
+        eot_token=script_args.eot_token, # the end of text token
+        length_penalty=script_args.len_penalty, # RZ: By default this is zero.
     )
-
-    if script_args.max_training_samples > 0:
+    if script_args.max_training_samples > 0: # By default this is -1, and we do not enter this branch.
         train_dataset = train_dataset.select(range(script_args.max_training_samples))
 
     # 3. Load evaluation dataset
@@ -254,20 +272,19 @@ if __name__ == "__main__":
     )
 
     # 4. initialize training arguments:
-
     training_args = TrainingArguments(
         per_device_train_batch_size=script_args.per_device_train_batch_size,
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
         # max_steps=script_args.max_steps,
-        num_train_epochs=script_args.num_train_epochs,
-        save_strategy=script_args.save_strategy,
-        logging_steps=script_args.logging_steps,
-        save_steps=script_args.save_steps,
+        num_train_epochs=script_args.num_train_epochs, # RZ: By default this is 2.
+        save_strategy=script_args.save_strategy, # RZ: epoch
+        logging_steps=script_args.logging_steps, # RZ: 2
+        save_steps=script_args.save_steps, # RZ: 50000 (?)
         gradient_accumulation_steps=script_args.gradient_accumulation_steps,
         gradient_checkpointing=script_args.gradient_checkpointing,
         learning_rate=script_args.learning_rate,
         evaluation_strategy="steps",
-        eval_steps=script_args.eval_steps,
+        eval_steps=script_args.eval_steps, # RZ: 100 (?)
         output_dir=script_args.output_dir,
         # report_to=script_args.report_to,
         lr_scheduler_type=script_args.lr_scheduler_type,
@@ -280,7 +297,6 @@ if __name__ == "__main__":
     print(training_args)
 
     # 5. initialize the DPO trainer
-
     dpo_trainer = PreferenceTrainer(
         model,
         model_ref,
@@ -304,3 +320,7 @@ if __name__ == "__main__":
     # 7. save
     output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
     dpo_trainer.model.save_pretrained(output_dir)
+
+### RZ: save_model() and model.save_pretrained both save models.
+# RZ: save_model is used when you need to resume training from exactly where it left off.
+# RZ: save_pretrained is used when the model is fully trained and ready for deployment or sharing.
