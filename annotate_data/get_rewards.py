@@ -167,3 +167,4 @@ if local_rank == 0: # RZ: this only runs in the first GPU.
     if script_args.record_dir is not None: # RZ: By default this is None.
         with open(script_args.record_dir, "a") as f:
             f.write(str(mean_scores) + "\t" + str(top1_scores) + "\n")
+print('Finishing annotating data..........')

@@ -19,7 +19,7 @@ fi
 # Array of GPU IDs to be used......
 declare -a gpus=(0 1)
 
-# conda activate vllm
+conda activate vllm
 for i in {0..1}; do
     CUDA_VISIBLE_DEVICES=${gpus[$i]} python ./generation/get_hf2.py --model_name_or_path ${infer_model} \
                                                                     --dataset_name_or_path ${prompt_dir} \
